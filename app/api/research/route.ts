@@ -1,6 +1,7 @@
 import {NextRequest,NextResponse} from "next/server";
 import {ASSET_NAMES,fetchQuote,fetchSeries,fetchNews,scoreHeadlines,scrapeArticleText,sma,rsi} from "../../lib/marketData";
 
+export const dynamic = "force-dynamic";
 export async function GET(req:NextRequest){
  const symbol=req.nextUrl.searchParams.get("symbol")||"BTC-USD";
  const name=ASSET_NAMES[symbol]||symbol;
