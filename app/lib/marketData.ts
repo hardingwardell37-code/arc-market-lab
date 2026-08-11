@@ -40,6 +40,22 @@ export type SeriesResult = {
   provider?: string;
 };
 
+// Twelve Data's free tier is rate-limited per minute. Coinbase (crypto) is unlimited and
+// untouched by this. Multiple independent pollers (the 2-min market poll, the screener,
+// and manual research) can land on the same non-crypto symbol within seconds of each
+// other, which is enough concurrent load to trip that limit even though each poller on
+// its own wouldn't. A short in-memory cache, scoped per warm server instance, collapses
+// those near-simultaneous calls into one upstream request instead of one each.
+const TWELVE_DATA_CACHE_MS = 45000;
+const twelveDataCache = new Map<string, { data: unknown; expires: number }>();
+async function cachedTwelveData<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const hit = twelveDataCache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.data as T;
+  const data = await load();
+  twelveDataCache.set(key, { data, expires: Date.now() + TWELVE_DATA_CACHE_MS });
+  return data;
+}
+
 function syntheticSeries(symbol: string, base: number, step = 900): SeriesPoint[] {
   const now = Math.floor(Date.now() / 1000);
   const points: SeriesPoint[] = [];
@@ -76,29 +92,32 @@ export async function fetchSeries(symbol: string, range = "1D"): Promise<SeriesR
   }
   const twelveKey = process.env.TWELVE_DATA_API_KEY;
   if (twelveKey && !symbol.endsWith("-USD")) {
-    // Same rate-limit-looks-like-empty-data caveat as fetchQuote above: one short-backoff
-    // retry before falling back to synthetic data, since the screener now adds load.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const r = await fetch(
-          `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${config.interval}&outputsize=${config.limit}`,
-          { headers: { Authorization: `apikey ${twelveKey}`, Accept: "application/json" } },
-        );
-        if (!r.ok) throw new Error("provider unavailable");
-        const data = (await r.json()) as { values?: Array<{ datetime: string; close: string }> };
-        if (!data.values?.length) throw new Error("no series");
-        const points = data.values
-          .slice()
-          .reverse()
-          .map((x) => ({ time: Math.floor(new Date(x.datetime + "Z").getTime() / 1000), price: Number(x.close) }))
-          .filter((x) => Number.isFinite(x.price));
-        const price = points.at(-1)?.price || base;
-        const previous = points[0]?.price || price;
-        return { points, price, changePct: previous ? ((price - previous) / previous) * 100 : 0, marketState: "LIVE", provider: "Twelve Data" };
-      } catch {
-        if (attempt === 0) await new Promise((res) => setTimeout(res, 1500));
-      }
-    }
+    try {
+      return await cachedTwelveData(`series:${symbol}:${range}`, async () => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const r = await fetch(
+              `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${config.interval}&outputsize=${config.limit}`,
+              { headers: { Authorization: `apikey ${twelveKey}`, Accept: "application/json" } },
+            );
+            if (!r.ok) throw new Error("provider unavailable");
+            const data = (await r.json()) as { values?: Array<{ datetime: string; close: string }> };
+            if (!data.values?.length) throw new Error("no series");
+            const points = data.values
+              .slice()
+              .reverse()
+              .map((x) => ({ time: Math.floor(new Date(x.datetime + "Z").getTime() / 1000), price: Number(x.close) }))
+              .filter((x) => Number.isFinite(x.price));
+            const price = points.at(-1)?.price || base;
+            const previous = points[0]?.price || price;
+            return { points, price, changePct: previous ? ((price - previous) / previous) * 100 : 0, marketState: "LIVE" as const, provider: "Twelve Data" };
+          } catch {
+            if (attempt === 0) await new Promise((res) => setTimeout(res, 1500));
+          }
+        }
+        throw new Error("twelve data unavailable after retry");
+      });
+    } catch {}
   }
   const points = syntheticSeries(symbol, base, config.step);
   const price = points.at(-1)?.price || base;
@@ -130,32 +149,37 @@ export async function fetchQuote(symbol: string): Promise<Quote | null> {
   const twelveKey = process.env.TWELVE_DATA_API_KEY;
   if (!twelveKey) return null;
   // Twelve Data's free tier enforces a per-minute request cap and signals it with a
-  // 200 OK + error-shaped JSON body (no `close` field) rather than a non-2xx status,
-  // so a rejected call looks identical to "bad quote" here. Now that the screener adds
-  // concurrent load on top of the market poll and manual research calls, a single
-  // short-backoff retry absorbs that kind of momentary contention instead of surfacing
-  // a hard failure to the user for something that resolves itself a few seconds later.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}`, {
-        headers: { Authorization: `apikey ${twelveKey}`, Accept: "application/json" },
-      });
-      if (!r.ok) throw new Error("provider unavailable");
-      const q = (await r.json()) as Record<string, string>;
-      const price = Number(q.close);
-      if (!Number.isFinite(price)) throw new Error("bad quote");
-      return {
-        price,
-        change24h: Number(q.percent_change) || 0,
-        high24h: Number(q.high),
-        low24h: Number(q.low),
-        volume24h: Number(q.volume),
-      };
-    } catch {
-      if (attempt === 0) await new Promise((res) => setTimeout(res, 1500));
-    }
+  // 200 OK + error-shaped JSON body (no `close` field) rather than a non-2xx status, so a
+  // rejected call looks identical to "bad quote" here. cachedTwelveData collapses repeat
+  // calls for the same symbol within its TTL into one upstream request (see definition
+  // above), and the retry loop absorbs whatever contention still gets through that.
+  try {
+    return await cachedTwelveData(`quote:${symbol}`, async () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const r = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}`, {
+            headers: { Authorization: `apikey ${twelveKey}`, Accept: "application/json" },
+          });
+          if (!r.ok) throw new Error("provider unavailable");
+          const q = (await r.json()) as Record<string, string>;
+          const price = Number(q.close);
+          if (!Number.isFinite(price)) throw new Error("bad quote");
+          return {
+            price,
+            change24h: Number(q.percent_change) || 0,
+            high24h: Number(q.high),
+            low24h: Number(q.low),
+            volume24h: Number(q.volume),
+          };
+        } catch {
+          if (attempt === 0) await new Promise((res) => setTimeout(res, 1500));
+        }
+      }
+      throw new Error("twelve data unavailable after retry");
+    });
+  } catch {
+    return null;
   }
-  return null;
 }
 
 export type Headline = { title: string; link: string; source: string; publishedAt: string; description?: string; scraped?: string };
