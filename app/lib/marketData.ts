@@ -40,18 +40,39 @@ export type SeriesResult = {
   provider?: string;
 };
 
-// Twelve Data's free tier is rate-limited per minute. Coinbase (crypto) is unlimited and
-// untouched by this. Multiple independent pollers (the 2-min market poll, the screener,
-// and manual research) can land on the same non-crypto symbol within seconds of each
-// other, which is enough concurrent load to trip that limit even though each poller on
-// its own wouldn't. A short in-memory cache, scoped per warm server instance, collapses
-// those near-simultaneous calls into one upstream request instead of one each.
+// Twelve Data's account dashboard (Basic 8 plan) confirmed the actual constraint: 8 API
+// credits per MINUTE, not a daily cap - daily usage was nowhere near exhausted. The prior
+// cache alone doesn't help when 5 different non-crypto symbols (AAPL/NVDA/SPY/QQQ/EUR-USD)
+// get fetched together in one burst (a single /api/screen scan, or the market poll fanning
+// out across the watchlist) - that's 5 distinct cache keys, each a fresh call, easily
+// stacking past 8/minute the moment more than one poller's burst lands in the same window.
+// A serializing queue with a fixed minimum gap between actual upstream calls is what
+// actually respects a per-minute cap; the cache still avoids re-fetching the same symbol
+// twice inside its TTL, so the two mechanisms cover different failure modes.
 const TWELVE_DATA_CACHE_MS = 45000;
+const TWELVE_DATA_MIN_GAP_MS = 8000; // 60s / 8 credits ≈ 7.5s; padded for safety margin
 const twelveDataCache = new Map<string, { data: unknown; expires: number }>();
+let twelveDataChain: Promise<void> = Promise.resolve();
+let twelveDataLastCallAt = 0;
+
+function throttledTwelveData<T>(fn: () => Promise<T>): Promise<T> {
+  const run = twelveDataChain.then(async () => {
+    const wait = TWELVE_DATA_MIN_GAP_MS - (Date.now() - twelveDataLastCallAt);
+    if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+    twelveDataLastCallAt = Date.now();
+    return fn();
+  });
+  twelveDataChain = run.then(
+    () => undefined,
+    () => undefined,
+  ); // never let one failed call block the ones queued behind it
+  return run;
+}
+
 async function cachedTwelveData<T>(key: string, load: () => Promise<T>): Promise<T> {
   const hit = twelveDataCache.get(key);
   if (hit && hit.expires > Date.now()) return hit.data as T;
-  const data = await load();
+  const data = await throttledTwelveData(load);
   twelveDataCache.set(key, { data, expires: Date.now() + TWELVE_DATA_CACHE_MS });
   return data;
 }
