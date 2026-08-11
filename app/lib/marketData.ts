@@ -40,41 +40,48 @@ export type SeriesResult = {
   provider?: string;
 };
 
-// Twelve Data's account dashboard (Basic 8 plan) confirmed the actual constraint: 8 API
-// credits per MINUTE, not a daily cap - daily usage was nowhere near exhausted. The prior
-// cache alone doesn't help when 5 different non-crypto symbols (AAPL/NVDA/SPY/QQQ/EUR-USD)
-// get fetched together in one burst (a single /api/screen scan, or the market poll fanning
-// out across the watchlist) - that's 5 distinct cache keys, each a fresh call, easily
-// stacking past 8/minute the moment more than one poller's burst lands in the same window.
-// A serializing queue with a fixed minimum gap between actual upstream calls is what
-// actually respects a per-minute cap; the cache still avoids re-fetching the same symbol
-// twice inside its TTL, so the two mechanisms cover different failure modes.
-const TWELVE_DATA_CACHE_MS = 45000;
-const TWELVE_DATA_MIN_GAP_MS = 8000; // 60s / 8 credits ≈ 7.5s; padded for safety margin
-const twelveDataCache = new Map<string, { data: unknown; expires: number }>();
-let twelveDataChain: Promise<void> = Promise.resolve();
-let twelveDataLastCallAt = 0;
+// Finnhub's free tier (~60 calls/minute) is far more generous than the Twelve Data plan
+// this replaced (8 credits/minute, confirmed from the account dashboard and repeatedly
+// tripped in production). Still worth a light cache + spacing: multiple pollers (market
+// poll, screener, research) can land on the same symbol within seconds of each other, and
+// there's no reason to spend real quota re-fetching the same data twice inside a few
+// seconds. Kept provider-neutral naming since this now serves Finnhub, not Twelve Data.
+const PROVIDER_CACHE_MS = 20000;
+const PROVIDER_MIN_GAP_MS = 1200; // 60s / ~50 calls, padded for safety margin
+const providerCache = new Map<string, { data: unknown; expires: number }>();
+let providerChain: Promise<void> = Promise.resolve();
+let providerLastCallAt = 0;
 
-function throttledTwelveData<T>(fn: () => Promise<T>): Promise<T> {
-  const run = twelveDataChain.then(async () => {
-    const wait = TWELVE_DATA_MIN_GAP_MS - (Date.now() - twelveDataLastCallAt);
+function throttledProviderCall<T>(fn: () => Promise<T>): Promise<T> {
+  const run = providerChain.then(async () => {
+    const wait = PROVIDER_MIN_GAP_MS - (Date.now() - providerLastCallAt);
     if (wait > 0) await new Promise((res) => setTimeout(res, wait));
-    twelveDataLastCallAt = Date.now();
+    providerLastCallAt = Date.now();
     return fn();
   });
-  twelveDataChain = run.then(
+  providerChain = run.then(
     () => undefined,
     () => undefined,
   ); // never let one failed call block the ones queued behind it
   return run;
 }
 
-async function cachedTwelveData<T>(key: string, load: () => Promise<T>): Promise<T> {
-  const hit = twelveDataCache.get(key);
+async function cachedProviderCall<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const hit = providerCache.get(key);
   if (hit && hit.expires > Date.now()) return hit.data as T;
-  const data = await throttledTwelveData(load);
-  twelveDataCache.set(key, { data, expires: Date.now() + TWELVE_DATA_CACHE_MS });
+  const data = await throttledProviderCall(load);
+  providerCache.set(key, { data, expires: Date.now() + PROVIDER_CACHE_MS });
   return data;
+}
+
+// Finnhub's forex symbols use an exchange-prefixed format; stock tickers pass through
+// unchanged. Exported so the client-side WebSocket subscription (app/page.tsx) can use
+// the same mapping for its own subscribe messages.
+export const FINNHUB_TICKER: Record<string, string> = { "EUR/USD": "OANDA:EUR_USD" };
+function finnhubResolution(range: string) {
+  if (range === "1H") return "1";
+  if (range === "1W") return "60";
+  return "15";
 }
 
 function syntheticSeries(symbol: string, base: number, step = 900): SeriesPoint[] {
@@ -111,32 +118,37 @@ export async function fetchSeries(symbol: string, range = "1D"): Promise<SeriesR
       return { points, price, changePct: previous ? ((price - previous) / previous) * 100 : 0, marketState: "LIVE" };
     } catch {}
   }
-  const twelveKey = process.env.TWELVE_DATA_API_KEY;
-  if (twelveKey && !symbol.endsWith("-USD")) {
+  const finnhubKey = process.env.FINNHUB_API_KEY;
+  if (finnhubKey && !symbol.endsWith("-USD")) {
+    const ticker = FINNHUB_TICKER[symbol] || symbol;
+    const isForex = ticker.startsWith("OANDA:");
+    const resolution = finnhubResolution(range);
     try {
-      return await cachedTwelveData(`series:${symbol}:${range}`, async () => {
+      return await cachedProviderCall(`series:${symbol}:${range}`, async () => {
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
+            const to = Math.floor(Date.now() / 1000);
+            const from = to - config.limit * config.step;
+            const endpoint = isForex ? "forex/candle" : "stock/candle";
             const r = await fetch(
-              `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${config.interval}&outputsize=${config.limit}`,
-              { headers: { Authorization: `apikey ${twelveKey}`, Accept: "application/json" } },
+              `https://finnhub.io/api/v1/${endpoint}?symbol=${encodeURIComponent(ticker)}&resolution=${resolution}&from=${from}&to=${to}&token=${finnhubKey}`,
+              { headers: { Accept: "application/json" } },
             );
             if (!r.ok) throw new Error("provider unavailable");
-            const data = (await r.json()) as { values?: Array<{ datetime: string; close: string }> };
-            if (!data.values?.length) throw new Error("no series");
-            const points = data.values
-              .slice()
-              .reverse()
-              .map((x) => ({ time: Math.floor(new Date(x.datetime + "Z").getTime() / 1000), price: Number(x.close) }))
+            const data = (await r.json()) as { c?: number[]; t?: number[]; s?: string };
+            if (data.s !== "ok" || !data.c?.length || !data.t?.length) throw new Error("no series");
+            const points = data.t
+              .map((time, i) => ({ time, price: data.c![i] }))
               .filter((x) => Number.isFinite(x.price));
+            if (!points.length) throw new Error("no usable points");
             const price = points.at(-1)?.price || base;
             const previous = points[0]?.price || price;
-            return { points, price, changePct: previous ? ((price - previous) / previous) * 100 : 0, marketState: "LIVE" as const, provider: "Twelve Data" };
+            return { points, price, changePct: previous ? ((price - previous) / previous) * 100 : 0, marketState: "LIVE" as const, provider: "Finnhub" };
           } catch {
-            if (attempt === 0) await new Promise((res) => setTimeout(res, 1500));
+            if (attempt === 0) await new Promise((res) => setTimeout(res, 1200));
           }
         }
-        throw new Error("twelve data unavailable after retry");
+        throw new Error("finnhub unavailable after retry");
       });
     } catch {}
   }
@@ -167,36 +179,31 @@ export async function fetchQuote(symbol: string): Promise<Quote | null> {
       return null;
     }
   }
-  const twelveKey = process.env.TWELVE_DATA_API_KEY;
-  if (!twelveKey) return null;
-  // Twelve Data's free tier enforces a per-minute request cap and signals it with a
-  // 200 OK + error-shaped JSON body (no `close` field) rather than a non-2xx status, so a
-  // rejected call looks identical to "bad quote" here. cachedTwelveData collapses repeat
-  // calls for the same symbol within its TTL into one upstream request (see definition
-  // above), and the retry loop absorbs whatever contention still gets through that.
+  const finnhubKey = process.env.FINNHUB_API_KEY;
+  if (!finnhubKey) return null;
+  const ticker = FINNHUB_TICKER[symbol] || symbol;
   try {
-    return await cachedTwelveData(`quote:${symbol}`, async () => {
+    return await cachedProviderCall(`quote:${symbol}`, async () => {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const r = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}`, {
-            headers: { Authorization: `apikey ${twelveKey}`, Accept: "application/json" },
+          const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${finnhubKey}`, {
+            headers: { Accept: "application/json" },
           });
           if (!r.ok) throw new Error("provider unavailable");
-          const q = (await r.json()) as Record<string, string>;
-          const price = Number(q.close);
-          if (!Number.isFinite(price)) throw new Error("bad quote");
+          const q = (await r.json()) as { c?: number; dp?: number; h?: number; l?: number };
+          const price = Number(q.c);
+          if (!Number.isFinite(price) || price === 0) throw new Error("bad quote");
           return {
             price,
-            change24h: Number(q.percent_change) || 0,
-            high24h: Number(q.high),
-            low24h: Number(q.low),
-            volume24h: Number(q.volume),
+            change24h: Number(q.dp) || 0,
+            high24h: Number(q.h),
+            low24h: Number(q.l),
           };
         } catch {
-          if (attempt === 0) await new Promise((res) => setTimeout(res, 1500));
+          if (attempt === 0) await new Promise((res) => setTimeout(res, 1200));
         }
       }
-      throw new Error("twelve data unavailable after retry");
+      throw new Error("finnhub unavailable after retry");
     });
   } catch {
     return null;
